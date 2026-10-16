@@ -37,7 +37,7 @@ import pandas as pd
 
 import macd_backtest as mb
 from rsi2 import metrics as M
-from rsi2.ab import ABConfig, EXIT_LABELS, run_suite
+from rsi2.ab import ABConfig, EXIT_LABELS, STOP_EXITS, STOP_PRESETS, default_time_stop, run_stop_grid, run_suite
 from rsi2.data import sanitize_ohlc, validate
 from rsi2.portfolio import Fill, simulate
 
@@ -62,11 +62,25 @@ for _L in RSI_LENGTHS:
     STRATEGY_INFO[f"A{_L}"] = (
         f"A · RSI({_L})", "Mean reversion",
         f"Buy at the next open when RSI({_L}) crosses under 10. After RSI crosses over 80, sell at the next open "
-        f"following the first bar where RSI falls. No stop-loss, no time exit.")
+        f"following the first bar where RSI falls.")
     STRATEGY_INFO[f"B{_L}"] = (
         f"B · RSI({_L}) + MACD", "Mean rev + MACD",
         f"Same entry as A. When RSI({_L}) crosses over 80: if a MACD-histogram BUY state happened since entry, "
         f"sell at the next open after the first close below MA5; otherwise use A's RSI decline watch.")
+
+
+
+
+def stop_rule_text(stop: str, rsi_length: int) -> str:
+    """Plain-English stop rule for one preset at one RSI length."""
+    rule = STOP_PRESETS[stop]
+    bits = []
+    if rule.time_stop:
+        bits.append(f"Time stop: if RSI hasn't crossed over 80 by the close of bar {default_time_stop(rsi_length)} "
+                    f"of the trade, sell at the next open.")
+    if rule.atr_mult:
+        bits.append(f"ATR stop: a close below entry − {rule.atr_mult:g}× ATR(14) sells at the next open.")
+    return " ".join(bits) if bits else "No stop-loss, no time exit."
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -243,6 +257,10 @@ def exit_path_stats(res: StrategyResult) -> dict:
     out = {"closed": 0 if led is None else len(led)}
     if led is None or not len(led):
         return out
+    stops = led[led["exit_reason"].isin(STOP_EXITS)]
+    out["stop_n"] = len(stops)
+    out["stop_pct"] = len(stops) / len(led) * 100
+    out["stop_avg"] = float(stops["net_ret_pct"].mean()) if len(stops) else None
     for reason, key in (("macd_ma5", "ma5"), ("rsi_decline", "rsi")):
         part = led[led["exit_reason"] == reason]
         r = part["net_ret_pct"].to_numpy(float)
@@ -275,6 +293,8 @@ class LabResult:
     trades: pd.DataFrame | None = None         # every A/B trade (also offered as CSV)
     pending: dict = field(default_factory=dict)
     cost_bps: float = COST_BPS
+    stop: str = "none"                         # STOP_PRESETS key used for the A/B runs above
+    stop_grid: pd.DataFrame | None = None      # every stop preset × A/B × RSI length
     notes: list = field(default_factory=list)
 
     def ranked(self) -> list[StrategyResult]:
@@ -282,10 +302,13 @@ class LabResult:
         return sorted(ok, key=lambda s: s.summary.get("total_return_pct", -1e9), reverse=True)
 
 
-def run_lab(ticker: str, timeframe: str = "weekly", daily: pd.DataFrame | None = None) -> LabResult:
+def run_lab(ticker: str, timeframe: str = "weekly", daily: pd.DataFrame | None = None,
+            stop: str = "none") -> LabResult:
     ticker = ticker.upper().strip()
     if timeframe not in TIMEFRAMES:
         raise ValueError("timeframe must be 'weekly' or 'daily'")
+    if stop not in STOP_PRESETS:
+        raise ValueError(f"stop must be one of: {', '.join(STOP_PRESETS)}")
     interval, tf_label = TIMEFRAMES[timeframe]
     notes = []
 
@@ -309,12 +332,16 @@ def run_lab(ticker: str, timeframe: str = "weekly", daily: pd.DataFrame | None =
         sweeps[kind] = rows
         strategies[kind] = evaluate(kind, daily, fills, start_bar, f"{params['label']} ({tf_label.lower()})")
 
-    suite = run_suite(daily, RSI_LENGTHS, start_bar=start_bar, base=AB_CONFIG)
+    suite = run_suite(daily, RSI_LENGTHS, start_bar=start_bar, base=AB_CONFIG, stop=stop)
+    stop_grid = run_stop_grid(daily, RSI_LENGTHS, start_bar=start_bar, base=AB_CONFIG)
+    stop_label = STOP_PRESETS[stop].label
     pending = {}
     for (strat, L), run in suite.runs.items():
         key = f"{strat}{L}"
         res = evaluate(key, daily, run.fills, start_bar,
-                       f"RSI({L}) <10 → >80 · fills at next open" + (" · MACD 12/26/9 daily, MA5" if strat == "B" else ""))
+                       f"RSI({L}) <10 → >80 · fills at next open" + (" · MACD 12/26/9 daily, MA5" if strat == "B" else "")
+                       + f" · stop: {stop_label}")
+        res.rules = f"{res.rules} {stop_rule_text(stop, L)}"
         if strat == "B":
             res.extra["paths"] = exit_path_stats(res)
         strategies[key] = res
@@ -327,4 +354,5 @@ def run_lab(ticker: str, timeframe: str = "weekly", daily: pd.DataFrame | None =
     return LabResult(ticker=ticker, timeframe=timeframe, tf_label=tf_label, daily=daily,
                      window_start=window_start, window_end=daily.index[-1], start_bar=start_bar,
                      strategies=strategies, benchmark=bench, benchmark_equity=bench_eq, sweeps=sweeps,
-                     comparison=suite.comparison, trades=suite.trades, pending=pending, notes=notes)
+                     comparison=suite.comparison, trades=suite.trades, pending=pending, notes=notes,
+                     stop=stop, stop_grid=stop_grid)

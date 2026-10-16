@@ -19,6 +19,9 @@ import pandas as pd
 
 CHART_JS = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
 
+# Stop-loss presets the Backtest tab offers (keys of rsi2.ab.STOP_PRESETS).
+from rsi2.ab import STOP_PRESETS  # noqa: E402
+
 TIMEFRAMES = {
     # web value : (macd_backtest interval, label)
     "weekly": ("1wk", "Weekly"),
@@ -474,13 +477,14 @@ def _estimates_html(r) -> str:
 #  BACKTEST
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_backtest(ticker: str, timeframe: str = "weekly") -> str:
+def render_backtest(ticker: str, timeframe: str = "weekly", stop: str = "none") -> str:
     """
     Strategy Lab: RSI mean-reversion Strategy A and B (MACD filter) for RSI
     2/3/4, plus MACD Histogram and MACD Crossover + MA50 as references, compared
     on the same data, window and costs (see regime_lab.py and rsi2/ab.py).
-    Raises RuntimeError on bad ticker.
+    stop: a rsi2.ab.STOP_PRESETS key used for the A/B runs; the report also
+    compares every stop preset. Raises RuntimeError on bad ticker.
     """
     import lab_report
     import regime_lab
-    return lab_report.render(regime_lab.run_lab(ticker, timeframe))
+    return lab_report.render(regime_lab.run_lab(ticker, timeframe, stop=stop))

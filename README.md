@@ -1,7 +1,7 @@
 # FinBot Web
 
-The Telegram financial bot, as a browser app. Four tabs, all reports rendered inline as HTML
-(each one downloadable):
+The Telegram financial bot, as a browser app. Five tabs, all reports rendered inline as HTML
+(each one downloadable, sendable to Telegram and saveable to a shared library):
 
 | Tab | What it does | Bot equivalent |
 |---|---|---|
@@ -9,6 +9,7 @@ The Telegram financial bot, as a browser app. Four tabs, all reports rendered in
 | **Estimates** | Forward revenue & EPS → implied prices, forward P/E vs TTM, analyst targets | `/estimate` |
 | **Backtest** | Strategy Lab: RSI mean-reversion Strategy A and B (MACD filter) × RSI 2/3/4, plus the 2 MACD momentum strategies for reference, compared on the same window | `/backtest`, `/backtestdaily` |
 | **Signals** | Subscribe to tickers; alerts appear in the feed | `/notify on/off/list` |
+| **Saved Reports** | Shared library of saved Financial Analysis, Estimates and Backtest reports | — |
 
 ### Analysis tab extras
 
@@ -52,6 +53,22 @@ as a reference.
   - otherwise it uses A's decline watch.
 - Each trade records its exit type (*MACD/MA5* or *RSI decline-watch*).
 
+**Stop-loss option.** A and B have no stop by default. The **Stop** menu next to *Run Backtest* applies one
+to all six A/B runs, and the report always adds a **Stop-Loss Comparison** of every option against no stop:
+
+| Option | Rule (decided on the daily close, filled at the next open) |
+|---|---|
+| None | exit only on the strategy's own sell rule |
+| Time | if RSI hasn't crossed over 80 by bar 10 / 15 / 20 of the trade (RSI 2 / 3 / 4), sell |
+| 2× / 2.5× / 3× ATR | close below entry − k × ATR(14) → sell. ATR is taken from the signal bar and the level is fixed for the trade |
+| Time + 3× ATR | both |
+
+The strategy's own exit is checked first; a stop fires only if it didn't. Because stops act on the close and fill
+at the next open, a gap can fill below the stop level. The comparison table switches between total return, max
+drawdown, return ÷ drawdown, worst trade, win rate, profit factor, average hold and % of exits that were stops, and
+the full 36-run table downloads as `stop_comparison.csv`. Exit types in the trade log gain *ATR stop* and *Time
+stop*, and the log records each trade's stop level.
+
 **Fair comparison.** Every run trades inside one common window after all indicators have warmed up,
 pays 4 bps per side (3 commission + 1 slippage), invests 100% of equity per trade and is marked to
 market daily. Buy & hold is the benchmark, with *return ÷ exposure* because these strategies sit in
@@ -71,11 +88,15 @@ top.
 ```bash
 python -m rsi2.ab --ticker AMD                      # RSI 2,3,4 → results/AMD_AB_<timestamp>/
 python -m rsi2.ab --csv data/amd.csv --lengths 2,3,4 --out-dir results/amd --repair-ohlc
+python -m rsi2.ab --ticker AMD --stop atr3 --compare-stops   # 3× ATR stop + stop_comparison.csv (36 runs)
+python -m rsi2.ab --ticker AMD --atr-stop-mult 2.5 --time-stop-bars 8   # custom stop
 ```
+
+`--stop` takes `none`, `time`, `atr2`, `atr2.5`, `atr3` or `time_atr3`.
 
 Prints the comparison table and writes `comparison.csv` (RSI length, strategy, total trades, win
 rate, avg win %, avg loss %, profit factor, total return %, max drawdown %, avg holding bars, and for
-B the % of MACD/MA5 vs RSI decline-watch exits) and `trades.csv` (entry date/price, exit
+B the % of MACD/MA5 vs RSI decline-watch exits, plus stop exits %, worst trade % and the stop used) and `trades.csv` (entry date/price, exit
 date/price, RSI length, strategy, exit type, trade return %, bars held; a trade still open at the
 end is listed with its status). In Python: `rsi2.ab.run_suite(df)` returns the same two pandas
 DataFrames.
@@ -128,13 +149,64 @@ survivorship-biased: it exists because it survived.
 the no-look-ahead test (truncated vs full data must give identical earlier trades), entry/exit timing,
 exit logic and priority, cost accounting, degenerate inputs, the CLI, and Strategy A/B (the
 75/83/86/81 example, crossover edges, the MACD BUY state, the permanent MA5 switch, exit-type
-logging, and look-ahead checks on the suite and the weekly candles).
+logging, and look-ahead checks on the suite and the weekly candles), and the stop-loss options (ATR level
+from the signal bar, strict close-below trigger, time-stop bar count, stops skipped/kept in each exit phase,
+priority, the 36-run grid, and look-ahead with stops on).
 
 **Pine cross-check (spec §12.7) — not done yet.** It needs TradingView: run
 `rsi2_mean_reversion.pine` on one ticker and date range, export the List of Trades, and compare with
 `trades.csv` from `python -m rsi2 --ticker <same> --start <same> --end <same>`. Trade count and every
 entry/exit *date* should match; small price differences are normal (vendor adjustments). A date
 mismatch means a timing difference — send me both files.
+
+## Saved Reports
+
+After a Financial Analysis, Estimates or Backtest report appears, a **Save this report to the
+library?** box asks for the ticker (pre-filled with the one the app detected — correct it if a CSV's
+ticker was wrong) and shows the name it will get:
+
+- `AAPL_financial_analysis_2026-10-16`
+- `AAPL_estimates_report_2026-10-16`
+- `AAPL_backtest_report_2026-10-16`
+
+The date is the day the report was **run** (in `REPORTS_TZ`). Saving the same kind of report for the
+same ticker again that day adds `_2`, `_3`, … — nothing is overwritten. Multi-CSV uploads list every
+report in one box with **Save all**; **Don't save** (or Esc) skips.
+
+**Reopening.** The **Saved Reports** tab lists everything, newest first, with filters for type,
+ticker and name. **📁 Past … reports** under each tab's input jumps there pre-filtered (and to the
+ticker you typed). Clicking a report opens it in its own tab exactly as it was generated, with a
+banner showing its name and run time; Download and Send to Telegram work as usual. Each report has
+a shareable link (`/?report=<id>`, also under 🔗 / *Copy link*).
+
+**Shared, no accounts:** anyone who can reach the app can see every saved report. Deleting is off
+unless `REPORTS_ADMIN_TOKEN` is set; then *Admin: delete reports* at the bottom of the tab unlocks
+Delete buttons for that browser tab.
+
+**How it's stored.** `REPORTS_DIR` (default `saved_reports/` next to `app.py`, git-ignored) holds
+`reports.sqlite3` (the index) and `files/<id>.html.gz` (each report, compressed, byte-for-byte as
+generated). Saving never uploads HTML from the browser: each generated report is kept on the server
+for 2 hours under a one-time token, and **Save** sends only that token and the ticker — so after 2
+hours (or a server restart) an unsaved report has to be re-run to be saved. If the folder isn't
+writable the app logs a warning, hides saving and keeps working.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `REPORTS_DIR` | `saved_reports/` | where the library lives — **a persistent disk on Render** |
+| `REPORTS_TZ` | `America/Los_Angeles` | time zone for the date in report names (needs `tzdata` on Windows — in requirements) |
+| `REPORTS_MAX` | `2000` | the library refuses new saves beyond this (nothing is auto-deleted) |
+| `REPORTS_ADMIN_TOKEN` | unset | enables deleting reports with this token |
+
+**On Render** the normal filesystem is wiped on every deploy and restart, which would empty the
+library. Attach a persistent disk (paid instances only): uncomment the `disk:` block and the
+`REPORTS_DIR` entry in `render.yaml` (mount `/var/data`, `REPORTS_DIR=/var/data/saved_reports`), or
+add the disk in the dashboard and set the variable there. `report_store.py` keeps storage behind a
+small interface (`save`, `list`, `get`, `delete`), so a database or S3-style backend can be added
+later without touching the UI.
+
+API: `POST /api/reports {report_token, ticker}` · `GET /api/reports?type=&ticker=&q=&limit=&offset=` ·
+`GET /api/reports/<id>` · `GET /api/reports/<id>/download` · `DELETE /api/reports/<id>` (header
+`X-Admin-Token`) · `GET /api/reports/status`.
 
 ## Run locally
 
@@ -157,8 +229,9 @@ Things to know before relying on Signals in production:
   duplicate alerts (the build spec said `--workers 2`; changed for this reason).
 - **Free-tier services sleep** after ~15 min without traffic, and the signal thread sleeps with
   them — no checks run until someone opens the site. Use a paid instance for real monitoring.
-- **Free-tier disk is ephemeral**: `signals.json` (subscriptions + feed) resets on every deploy or
-  restart. Attach a Render Disk and point `SIGNALS_FILE` at it to keep it.
+- **Free-tier disk is ephemeral**: `signals.json` (subscriptions + feed) and the **Saved Reports
+  library** reset on every deploy or restart. Attach a Render Disk and point `SIGNALS_FILE` and
+  `REPORTS_DIR` at it to keep them (see *Saved Reports* above).
 - **Telegram on a public URL:** anyone who can open the deployed site can post to channels your
   bot administers. Keep the Render URL private, or leave `TELEGRAM_BOT_TOKEN` unset there.
 - Yahoo Finance sometimes rate-limits cloud IPs; if ticker lookups start failing on Render but work
@@ -181,6 +254,7 @@ regime_lab.py     Backtest tab: all 5 strategies  lab_report.py      Backtest ta
 rsi2/             RSI(2) engine, metrics, CLI     tests/             pytest suite (python -m pytest tests)
 pipeline.py       CSV → HTML (mirrors bot.py)     compare_report.py  multi-company comparison report
 signal_worker.py  background signal thread        telegram_share.py  send reports to Telegram
+report_store.py   Saved Reports library + tokens
 static/           index.html, app.js, styles.css  wsgi.py            Gunicorn entry point
 financial_analysis.py, tradingview_downloader.py                   — copied from the bot, unchanged
 html_report.py, macd_backtest.py, estimates_analysis.py            — copied from the bot, changes below

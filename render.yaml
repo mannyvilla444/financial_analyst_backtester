@@ -18,3 +18,19 @@ services:
         value: "3600"
       - key: TELEGRAM_BOT_TOKEN      # set in the Render dashboard (kept out of git)
         sync: false
+      # ── Saved Reports library ──────────────────────────────────────────────
+      - key: REPORTS_TZ             # the day in a report's name is the run date in this zone
+        value: America/Los_Angeles
+      - key: REPORTS_ADMIN_TOKEN    # set in the dashboard to allow deleting reports; leave unset to disable
+        sync: false
+      # Without a persistent disk the library is WIPED on every deploy/restart.
+      # Persistent disks need a paid instance. To keep saved reports, uncomment
+      # the disk block and REPORTS_DIR below (and optionally move signals.json too):
+      # - key: REPORTS_DIR
+      #   value: /var/data/saved_reports
+      # - key: SIGNALS_FILE
+      #   value: /var/data/signals.json
+    # disk:
+    #   name: finbot-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

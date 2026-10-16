@@ -10,6 +10,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from rsi2.ab import STOP_PRESETS, default_time_stop
 from web_reports import _page, _header, _e, _json, _table
 
 ORDER = ["histogram", "crossover", "A2", "A3", "A4", "B2", "B3", "B4"]
@@ -24,6 +25,7 @@ SHORT = {"histogram": "Histogram", "crossover": "Crossover",
 REASONS = {
     "stop": "ATR stop", "signal": "Sell signal",
     "rsi_decline": "RSI decline-watch", "macd_ma5": "MACD/MA5",
+    "atr_stop": "ATR stop", "time_stop": "Time stop",
 }
 
 
@@ -111,6 +113,16 @@ _EXTRA_CSS_T = """
   .dl { font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 8px; cursor: pointer;
         border: 1px solid var(--border); background: var(--card); color: var(--text); }
   .dl:hover { border-color: var(--accent); }
+  .stop-badge { font-size: 13px; margin: 0 0 8px; padding: 8px 12px; border-radius: 8px; background: var(--best-bg); }
+  .stop-badge span { color: var(--muted); }
+  .sg td, .sg th { text-align:right; padding: 8px 6px; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .sg th { font-size: 10px; white-space: normal; line-height: 1.25; vertical-align: bottom; }
+  .sg td:first-child, .sg th:first-child { text-align:left; white-space:nowrap; }
+  .sg th.inuse { box-shadow: inset 0 -3px 0 var(--accent); }
+  .sg td.inuse { box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--accent); }
+  .sg td.best { background: var(--best-bg) !important; font-weight:700; }
+  .sg .star { font-size:10px; }
+  .sg .d { display:block; font-size:10.5px; color: var(--muted); font-weight:400; }
   .yr td, .yr th { text-align:right; }
   .yr td:first-child, .yr th:first-child { text-align:left; }
 </style>
@@ -224,7 +236,11 @@ def render(lab) -> str:
 </div>""")
 
     # ── A vs B × RSI length (the requested comparison table) ────────────────
-    comp = lab.comparison.copy()
+    stop = getattr(lab, "stop", "none") or "none"
+    stop_label = STOP_PRESETS[stop].label
+    full_comp = lab.comparison.copy()
+    hide = ["Stop-loss", "Worst trade %"] + (["Stop exits %"] if stop == "none" else [])
+    comp = full_comp.drop(columns=[c for c in hide if c in full_comp.columns])
     def cfmt(col, v):
         if v is None or (isinstance(v, float) and math.isnan(v)):
             return "—"
@@ -236,7 +252,7 @@ def render(lab) -> str:
             return "∞" if v == float("inf") else f"{v:.2f}"
         if col in ("Avg holding (bars)",):
             return f"{v:.1f}"
-        if col in ("Win rate %", "MACD/MA5 exits %", "RSI decline exits %"):
+        if col in ("Win rate %", "MACD/MA5 exits %", "RSI decline exits %", "Stop exits %"):
             return f"{v:.0f}%"
         return f"{v:+.2f}%" if col in ("Avg win %", "Avg loss %") else f"{v:+.1f}%"
     comp_best = {}
@@ -280,20 +296,29 @@ def render(lab) -> str:
                         f"Strategy A trades from RSI({int(tr.index[0])}) to RSI({int(tr.index[-1])}).</li>")
     if (comp["Open at end"] > 0).any():
         open_runs = ", ".join(f"{r['Strategy']}·RSI{int(r['RSI length'])}" for _, r in comp[comp['Open at end'] > 0].iterrows())
+        why = (" With no stop-loss, a trade whose RSI never crosses over 80 stays open." if stop == "none" else "")
         insights.append(f"<li>Still in a trade at the end (not counted in the trade stats, included in total return): "
-                        f"{open_runs}. With no stop-loss, a trade whose RSI never crosses over 80 stays open.</li>")
+                        f"{open_runs}.{why}</li>")
 
     csv_data = {
-        "comparison": {"name": f"{lab.ticker}_AB_comparison.csv", "cols": list(comp.columns),
+        "comparison": {"name": f"{lab.ticker}_AB_comparison{'' if stop == 'none' else '_' + stop}.csv",
+                       "cols": list(full_comp.columns),
                        "rows": [[None if (isinstance(v, float) and not math.isfinite(v)) else
-                                 (v.item() if hasattr(v, "item") else v) for v in r] for r in comp.itertuples(index=False)]},
-        "trades": {"name": f"{lab.ticker}_AB_trades.csv", "cols": list(lab.trades.columns),
+                                 (v.item() if hasattr(v, "item") else v) for v in r] for r in full_comp.itertuples(index=False)]},
+        "trades": {"name": f"{lab.ticker}_AB_trades{'' if stop == 'none' else '_' + stop}.csv", "cols": list(lab.trades.columns),
                    "rows": [[None if (isinstance(v, float) and not math.isfinite(v)) else
                              (v.item() if hasattr(v, "item") else v) for v in r] for r in lab.trades.itertuples(index=False)]},
     }
+    grid = getattr(lab, "stop_grid", None)
+    if grid is not None and len(grid):
+        csv_data["stops"] = {"name": f"{lab.ticker}_AB_stop_comparison.csv", "cols": list(grid.columns),
+                             "rows": [[None if (isinstance(v, float) and not math.isfinite(v)) else
+                                       (v.item() if hasattr(v, "item") else v) for v in r]
+                                      for r in grid.itertuples(index=False)]}
     parts.append(f"""
 <div class='section-heading'>Strategy A vs B × RSI Length</div>
 <div class='card'>
+  <div class='stop-badge'>Stop-loss: <b>{_e(stop_label)}</b>{_e(_stop_desc(stop))}</div>
   <div class='card-desc'>6 runs on daily bars, same window and costs. Returns are net of {lab.cost_bps:g} bps per side;
     total return and drawdown use daily mark-to-market (100% of equity per trade). Trade statistics count closed
     trades; an open trade shows under “Open at end”. ★ = best of the six.</div>
@@ -313,17 +338,21 @@ def render(lab) -> str:
     var s = typeof v === 'number' ? String(Math.round(v * 1e4) / 1e4) : String(v);
     return /[",\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   }}
-  document.querySelectorAll('button.dl').forEach(function(b) {{
-    b.addEventListener('click', function() {{
-      var t = D[b.getAttribute('data-csv')];
-      var csv = [t.cols.map(cell).join(',')].concat(t.rows.map(function(r) {{ return r.map(cell).join(','); }})).join('\\n');
-      var url = URL.createObjectURL(new Blob([csv], {{ type: 'text/csv' }}));
-      var a = document.createElement('a'); a.href = url; a.download = t.name;
-      document.body.appendChild(a); a.click(); setTimeout(function() {{ URL.revokeObjectURL(url); a.remove(); }}, 500);
-    }});
+  document.addEventListener('click', function(e) {{
+    var b = e.target.closest ? e.target.closest('button.dl') : null;
+    if (!b) return;
+    var t = D[b.getAttribute('data-csv')];
+    if (!t) return;
+    var csv = [t.cols.map(cell).join(',')].concat(t.rows.map(function(r) {{ return r.map(cell).join(','); }})).join('\\n');
+    var url = URL.createObjectURL(new Blob([csv], {{ type: 'text/csv' }}));
+    var a = document.createElement('a'); a.href = url; a.download = t.name;
+    document.body.appendChild(a); a.click(); setTimeout(function() {{ URL.revokeObjectURL(url); a.remove(); }}, 500);
   }});
 }})();
 </script>""")
+
+    if grid is not None and len(grid):
+        parts.append(_stop_section(lab, grid, stop))
 
     # ── equity curves: A and B, coloured by RSI length ──────────────────────
     idx = lab.benchmark_equity.index
@@ -403,7 +432,7 @@ def render(lab) -> str:
             if ma_n == 0:
                 verdict = "The MACD BUY state never came before RSI crossed over 80, so every trade used A's decline watch."
             elif rs_n == 0:
-                verdict = (f"Every closed trade took the MACD/MA5 exit — a MACD BUY state had always appeared before RSI "
+                verdict = (f"Every trade that reached RSI 80 took the MACD/MA5 exit — a MACD BUY state had always appeared before RSI "
                            f"crossed over 80 — averaging {_pct(h.get('ma5_avg'), True, 2)} over "
                            f"{_num(h.get('ma5_bars'), 1)} bars.")
             else:
@@ -421,6 +450,7 @@ def render(lab) -> str:
     <div><span>Closed trades</span><span>{h.get('closed', 0)}</span></div>
     <div><span>MACD/MA5 exits</span><span>{h.get('ma5_n', 0)} ({_pct(h.get('ma5_pct'), False, 0)})</span></div>
     <div><span>RSI decline-watch exits</span><span>{h.get('rsi_n', 0)} ({_pct(h.get('rsi_pct'), False, 0)})</span></div>
+    {f"<div><span>Stop exits</span><span>{h.get('stop_n', 0)} ({_pct(h.get('stop_pct'), False, 0)}) · avg {_pct(h.get('stop_avg'), True, 2)}</span></div>" if stop != "none" else ""}
     <div><span>Avg return MA5 / RSI</span><span>{_pct(h.get('ma5_avg'), True, 2)} / {_pct(h.get('rsi_avg'), True, 2)}</span></div>
     <div><span>Win rate MA5 / RSI</span><span>{_pct(h.get('ma5_win'), False, 0)} / {_pct(h.get('rsi_win'), False, 0)}</span></div>
     <div><span>Avg bars MA5 / RSI</span><span>{_num(h.get('ma5_bars'), 1)} / {_num(h.get('rsi_bars'), 1)}</span></div>
@@ -431,7 +461,7 @@ def render(lab) -> str:
 <div class='section-heading'>Strategy B — Exit Paths</div>
 <div class='card-desc'>Each Strategy B trade decides its exit when RSI crosses over 80: if a MACD-histogram BUY state
   (first bar of a fresh 2-rising-bars streak, daily MACD 12/26/9) happened since entry, it exits on the first close below
-  MA5; otherwise it uses Strategy A's RSI decline watch.</div>
+  MA5; otherwise it uses Strategy A's RSI decline watch.{"" if stop == "none" else " Trades closed by the " + _e(stop_label.lower()) + " before that point are counted under “Stop exits”."}</div>
 <div class='handoff'>{cards}</div>""")
 
     # ── per-strategy cards ───────────────────────────────────────────────────
@@ -605,3 +635,210 @@ def render(lab) -> str:
                  "the best of 12 tested on this same data, so their results are optimistic. Backtesting a currently-listed "
                  "ticker is survivorship-biased. "
                  "Past performance ≠ future results. Not financial advice.")
+
+
+# ── Stop-loss comparison ──────────────────────────────────────────────────────
+
+def _stop_desc(stop: str) -> str:
+    rule = STOP_PRESETS[stop]
+    bits = []
+    if rule.time_stop:
+        bits.append(f"sell at the next open if RSI hasn't crossed over 80 by bar "
+                    f"{default_time_stop(2)} / {default_time_stop(3)} / {default_time_stop(4)} (RSI 2 / 3 / 4)")
+    if rule.atr_mult:
+        bits.append(f"sell at the next open after a close below entry − {rule.atr_mult:g}× ATR(14)")
+    return (" — " + "; ".join(bits) + ".") if bits else " — trades exit only on the strategy's own sell rule."
+
+
+_STOP_METRICS = [
+    # column, button label, better ("high" or None), format
+    ("Total return %", "Total return", "high", "pct1"),
+    ("Max drawdown %", "Max drawdown", "high", "pct1"),
+    ("Return ÷ |max DD|", "Return ÷ drawdown", "high", "x"),
+    ("Worst trade %", "Worst trade", "high", "pct1"),
+    ("Win rate %", "Win rate", "high", "pct0"),
+    ("Profit factor", "Profit factor", "high", "num2"),
+    ("Avg holding (bars)", "Avg hold (bars)", None, "num1"),
+    ("Stop exits %", "Stop exits", None, "pct0u"),
+]
+
+
+def _ending_ratio(r_stop, r_none):
+    a, b = _n(r_stop), _n(r_none)
+    return None if a is None or b is None or b <= -100 else (1 + a / 100) / (1 + b / 100) - 1
+
+
+def _stop_section(lab, grid: pd.DataFrame, stop: str) -> str:
+    g = grid.copy()
+    g["Return ÷ |max DD|"] = [(_n(r) / abs(d)) if _n(r) is not None and _n(d) not in (None, 0) else None
+                             for r, d in zip(g["Total return %"], g["Max drawdown %"])]
+    labels = [STOP_PRESETS[k].label for k in STOP_PRESETS]
+    none_label = STOP_PRESETS["none"].label
+    runs = []
+    for L in sorted(g["RSI length"].unique()):
+        for strat in ("A", "B"):
+            if ((g["RSI length"] == L) & (g["Strategy"] == strat)).any():
+                runs.append((strat, int(L)))
+    vals = {}
+    for col, *_ in _STOP_METRICS:
+        vals[col] = {}
+        for strat, L in runs:
+            row = []
+            for lab_ in labels:
+                v = g.loc[(g["RSI length"] == L) & (g["Strategy"] == strat) & (g["Stop-loss"] == lab_), col]
+                f = v.iloc[0] if len(v) else None
+                if col == "Profit factor" and f == float("inf"):
+                    row.append("inf")
+                else:
+                    row.append(_n(f))
+            vals[col][f"{strat}{L}"] = row
+    data = {"stops": labels, "inuse": labels.index(STOP_PRESETS[stop].label),
+            "runs": [{"key": f"{s}{L}", "label": f"{s} · RSI({L})"} for s, L in runs],
+            "metrics": [{"col": c, "label": lb, "better": b, "fmt": f} for c, lb, b, f in _STOP_METRICS],
+            "vals": vals}
+
+    # ── plain-English takeaways ──
+    ins = []
+    n_runs = len(runs)
+    best_ret = {}
+    for strat, L in runs:
+        rv = vals["Total return %"][f"{strat}{L}"]
+        ok = [(v, -i) for i, v in enumerate(rv) if v is not None]
+        if ok:
+            best_ret[(strat, L)] = labels[-max(ok)[1]]          # ties go to the earlier column (No stop first)
+    nostop_best = sum(1 for v in best_ret.values() if v == none_label)
+    if best_ret:
+        if nostop_best == n_runs:
+            ins.append(f"<li><b>Total return:</b> no stop was best (or tied) in all {n_runs} runs.</li>")
+        else:
+            winners = ", ".join(f"{s}·RSI{L} → {_e(v)}" for (s, L), v in best_ret.items() if v != none_label)
+            ins.append(f"<li><b>Total return:</b> no stop was best (or tied) in {nostop_best} of {n_runs} runs; "
+                       f"a stop did better in {winners}.</li>")
+    # ending equity vs no stop, averaged (geometric) across runs
+    eff = []
+    for k, lab_ in enumerate(labels):
+        if lab_ == none_label:
+            continue
+        ratios = [_ending_ratio(vals["Total return %"][f"{s}{L}"][k], vals["Total return %"][f"{s}{L}"][0]) for s, L in runs]
+        ratios = [r for r in ratios if r is not None]
+        if ratios:
+            gm = float(np.exp(np.mean(np.log1p(ratios)))) - 1
+            eff.append(f"{_e(lab_)} {gm * 100:+.0f}%")
+    if eff:
+        ins.append(f"<li><b>Ending equity vs no stop</b> (average of the {n_runs} runs): {', '.join(eff)}.</li>")
+    # drawdown
+    dd_better, biggest = 0, None
+    for s, L in runs:
+        row = vals["Max drawdown %"][f"{s}{L}"]
+        base = row[0]
+        if base is None:
+            continue
+        cands = [(v, i) for i, v in enumerate(row[1:], 1) if v is not None]
+        if not cands:
+            continue
+        v, i = max(cands)
+        if v > base + 0.05:
+            dd_better += 1
+            if biggest is None or v - base > biggest[0]:
+                biggest = (v - base, s, L, base, v, labels[i])
+    txt = f"<li><b>Max drawdown:</b> at least one stop made it shallower in {dd_better} of {n_runs} runs"
+    if biggest:
+        _, s_, L_, b_, v_, lb_ = biggest
+        txt += f" (biggest: {s_}·RSI{L_} {b_:.1f}% → {v_:.1f}% with {_e(lb_)})"
+    ins.append(txt + ".</li>")
+    # worst trade
+    worse = better = 0
+    for s, L in runs:
+        row = vals["Worst trade %"][f"{s}{L}"]
+        if row[0] is None:
+            continue
+        for v in row[1:]:
+            if v is None:
+                continue
+            if v > row[0] + 0.05:
+                better += 1
+            elif v < row[0] - 0.05:
+                worse += 1
+    if better or worse:
+        note = (" A stop sells near the low; without one, some of those trades recovered." if worse else "")
+        ins.append(f"<li><b>Worst trade:</b> across all stop/run pairs, a stop improved the worst trade {better} "
+                   f"time(s) and made it worse {worse} time(s).{note}</li>")
+    # risk-adjusted
+    rd = {}
+    for s, L in runs:
+        row = vals["Return ÷ |max DD|"][f"{s}{L}"]
+        ok = [(v, -i) for i, v in enumerate(row) if v is not None]
+        if ok:
+            k = labels[-max(ok)[1]]
+            rd[k] = rd.get(k, 0) + 1
+    if rd:
+        top = sorted(rd.items(), key=lambda kv: -kv[1])
+        ins.append("<li><b>Best return ÷ drawdown:</b> " + ", ".join(f"{_e(k)} in {v} run(s)" for k, v in top) + ".</li>")
+
+    on = " class='on'"
+    btns = "".join(f"<button data-i='{i}'{on if i == 0 else ''}>{_e(m[1])}</button>"
+                   for i, m in enumerate(_STOP_METRICS))
+    return f"""
+<div class='section-heading'>Stop-Loss Comparison</div>
+<div class='card'>
+  <div class='card-desc'>Strategy A and B × RSI 2/3/4 re-run with each stop — same entries, window and {lab.cost_bps:g} bps
+    costs. <b>Time stop</b>: if RSI hasn't crossed over 80 by bar {default_time_stop(2)} / {default_time_stop(3)} /
+    {default_time_stop(4)} of the trade (RSI 2 / 3 / 4), sell at the next open. <b>ATR stop</b>: a daily close below
+    entry − k × ATR(14) sells at the next open, so a gap can fill below the stop. The underlined column is the stop used in
+    the rest of this report (pick another in the Stop menu above the report). ★ = best in each row (a stop that ties
+    No stop never fired).</div>
+  <div class='range-btns' id='sgBtns' style='flex-wrap:wrap'>{btns}</div>
+  <div class='table-wrap'><table class='data-table sg' id='sgTable'></table></div>
+  <ul class='insights'>{''.join(ins)}</ul>
+  <div class='dl-row'><button class='dl' data-csv='stops'>⬇ stop_comparison.csv (all 36 runs)</button></div>
+</div>
+<script type='application/json' id='sg-data'>{_json(data)}</script>
+<script>
+(function() {{
+  var D = JSON.parse(document.getElementById('sg-data').textContent);
+  var tbl = document.getElementById('sgTable'), btns = document.querySelectorAll('#sgBtns button');
+  function fmt(v, f) {{
+    if (v === 'inf') return '∞';
+    if (v === null || v === undefined) return '–';
+    if (f === 'pct1') return (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v).toFixed(1) + '%';
+    if (f === 'pct0' || f === 'pct0u') return v.toFixed(0) + '%';
+    if (f === 'num2') return v.toFixed(2);
+    if (f === 'x') return v.toFixed(1) + '×';
+    return v.toFixed(1);
+  }}
+  function num(v) {{ return v === 'inf' ? Infinity : v; }}
+  function draw(mi) {{
+    var m = D.metrics[mi];
+    var h = '<thead><tr><th>Run</th>' + D.stops.map(function(s, i) {{
+      return '<th' + (i === D.inuse ? ' class="inuse" title="Used in the rest of this report"' : '') + '>' + s + '</th>'; }}).join('') + '</tr></thead><tbody>';
+    D.runs.forEach(function(r) {{
+      var row = D.vals[m.col][r.key], best = null;
+      if (m.better) {{
+        var ok = row.filter(function(v) {{ return v !== null; }}).map(num);
+        if (ok.length > 1 && Math.max.apply(null, ok) !== Math.min.apply(null, ok)) best = Math.max.apply(null, ok);
+      }}
+      h += '<tr><td><span class="dot" style="background:var(--s-' + r.key + ')"></span>' + r.label + '</td>';
+      row.forEach(function(v, i) {{
+        var cls = [];
+        if (best !== null && v !== null && num(v) === best) cls.push('best');
+        if (i === D.inuse) cls.push('inuse');
+        if (m.fmt === 'pct1' && v !== null) cls.push(v > 0 ? 'positive' : v < 0 ? 'negative' : '');
+        var sub = '';
+        if (m.col === 'Total return %' && i > 0 && v !== null && row[0] !== null) {{
+          var d = v - row[0]; sub = '<span class="d">' + (d >= 0 ? '+' : '−') + Math.abs(d).toFixed(0) + ' pts</span>';
+        }}
+        var star = cls.indexOf('best') >= 0 ? '<span class="star"> ★</span>' : '';
+        h += '<td class="' + cls.join(' ').trim() + '">' + fmt(v, m.fmt) + star + sub + '</td>';
+      }});
+      h += '</tr>';
+    }});
+    tbl.innerHTML = h + '</tbody>';
+  }}
+  btns.forEach(function(b) {{
+    b.addEventListener('click', function() {{
+      btns.forEach(function(x) {{ x.classList.remove('on'); }}); b.classList.add('on'); draw(+b.getAttribute('data-i'));
+    }});
+  }});
+  draw(0);
+}})();
+</script>"""

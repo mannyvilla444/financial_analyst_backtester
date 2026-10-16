@@ -1,11 +1,12 @@
 # app.py
+import hmac
 import logging
 import os
 import re
 import threading
 
 from dotenv import load_dotenv, dotenv_values
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, Response, request, jsonify, send_from_directory
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -34,6 +35,7 @@ import web_reports                                         # noqa: E402
 import compare_report                                      # noqa: E402
 import signal_worker                                       # noqa: E402
 import telegram_share                                      # noqa: E402
+import report_store                                        # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -47,6 +49,37 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-only-not-secret")
 
 SIGNALS_FILE = os.environ.get("SIGNALS_FILE", os.path.join(BASE_DIR, "signals.json"))
 TELEGRAM_LINKS_FILE = os.environ.get("TELEGRAM_LINKS_FILE", os.path.join(BASE_DIR, "telegram_links.json"))
+
+# ── Saved Reports library ─────────────────────────────────────────────────────
+# Every generated report is parked in PENDING_REPORTS under a token that goes
+# back with the report; POST /api/reports {report_token, ticker} saves the
+# server's own copy. The library lives in REPORTS_DIR — on Render, mount a
+# persistent disk there or the library is wiped on every deploy.
+REPORTS_DIR = os.environ.get("REPORTS_DIR") or os.path.join(BASE_DIR, "saved_reports")
+REPORTS_TZ = report_store.load_tz(os.environ.get("REPORTS_TZ"))
+try:
+    REPORTS_MAX = int(os.environ.get("REPORTS_MAX") or 2000)
+except ValueError:
+    REPORTS_MAX = 2000
+REPORTS = report_store.LocalReportStore(REPORTS_DIR, REPORTS_TZ, REPORTS_MAX)
+PENDING_REPORTS = report_store.PendingCache()
+
+
+def _admin_token() -> str:
+    return (os.environ.get("REPORTS_ADMIN_TOKEN") or "").strip()
+
+
+def _report_offer(html: str, rtype: str, ticker: str, source: dict, params: dict | None = None) -> dict:
+    """Extra response fields so the browser can offer to save this report (empty if saving is off)."""
+    if not REPORTS.available:
+        return {"report_save": {"available": False}}
+    token, rep = PENDING_REPORTS.put(html, rtype, ticker, source, params)
+    return {"report_token": token,
+            "report_save": {"available": True, "type": rtype, "type_part": report_store.REPORT_TYPES[rtype][0],
+                            "run_date": report_store.run_date(rep.created_at, REPORTS_TZ),
+                            "created_at": report_store._iso(rep.created_at),
+                            "suggested_ticker": report_store.suggest_ticker(ticker)}}
+
 
 # Tickers like AMD, BRK.B, BF-B, ^GSPC, EURUSD=X
 TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,14}$")
@@ -99,7 +132,9 @@ def analyze_csv():
         return jsonify(error="File must be a .csv"), 400
     try:
         html_bytes, ticker, filename, summary = run_analysis(f.read(), f.filename)
-        return jsonify(ticker=ticker, html=html_bytes.decode("utf-8"), filename=filename, summary=summary)
+        html = html_bytes.decode("utf-8")
+        return jsonify(ticker=ticker, html=html, filename=filename, summary=summary,
+                       **_report_offer(html, "financial", ticker, {"kind": "csv", "filename": f.filename[:200]}))
     except ValueError as e:
         return jsonify(error=str(e)), 422
     except Exception as e:
@@ -134,7 +169,9 @@ def analyze_ticker():
         # weekly close inside run_analysis if yfinance can't provide one).
         html_bytes, ticker, html_name, summary = run_analysis(
             csv_bytes, filename, current_price=_live_price(ticker))
-        return jsonify(ticker=ticker, html=html_bytes.decode("utf-8"), filename=html_name, summary=summary)
+        html = html_bytes.decode("utf-8")
+        return jsonify(ticker=ticker, html=html, filename=html_name, summary=summary,
+                       **_report_offer(html, "financial", ticker, {"kind": "ticker"}))
     except (RuntimeError, ValueError) as e:
         return jsonify(error=str(e)), 422
     except Exception as e:
@@ -238,7 +275,8 @@ def analyze_estimates():
     try:
         # Never raises for missing data — returns a "no estimates" page instead.
         html_str = web_reports.render_estimates(ticker)
-        return jsonify(ticker=ticker, html=html_str, filename=f"{ticker}_estimates.html")
+        return jsonify(ticker=ticker, html=html_str, filename=f"{ticker}_estimates.html",
+                       **_report_offer(html_str, "estimates", ticker, {"kind": "ticker"}))
     except Exception as e:
         logger.exception(f"Estimates failed for {ticker}")
         return jsonify(error=f"Estimates failed: {e}"), 500
@@ -253,15 +291,131 @@ def run_backtest():
     timeframe = data.get("timeframe", "weekly")   # "weekly" | "daily"
     if timeframe not in web_reports.TIMEFRAMES:
         return jsonify(error="timeframe must be 'weekly' or 'daily'"), 400
+    stop = data.get("stop") or "none"              # a rsi2.ab.STOP_PRESETS key
+    if stop not in web_reports.STOP_PRESETS:
+        return jsonify(error=f"stop must be one of: {', '.join(web_reports.STOP_PRESETS)}"), 400
     try:
-        html_str = web_reports.render_backtest(ticker, timeframe)
-        return jsonify(ticker=ticker, html=html_str, timeframe=timeframe,
-                       filename=f"{ticker}_MACD_{timeframe}_backtest.html")
+        html_str = web_reports.render_backtest(ticker, timeframe, stop)
+        suffix = "" if stop == "none" else f"_stop-{stop}"
+        return jsonify(ticker=ticker, html=html_str, timeframe=timeframe, stop=stop,
+                       filename=f"{ticker}_backtest_{timeframe}{suffix}.html",
+                       **_report_offer(html_str, "backtest", ticker, {"kind": "ticker"},
+                                       {"timeframe": timeframe, "stop": stop,
+                                        "stop_label": web_reports.STOP_PRESETS[stop].label}))
     except RuntimeError as e:
         return jsonify(error=str(e)), 422
     except Exception as e:
         logger.exception(f"Backtest failed for {ticker}")
         return jsonify(error=f"Backtest failed: {e}"), 500
+
+
+# ── Saved Reports library ──────────────────────────────────────────────────────
+@app.errorhandler(report_store.ReportError)
+def _report_error(e):
+    return jsonify(error=str(e)), e.status
+
+
+def _is_admin() -> bool:
+    want, got = _admin_token(), (request.headers.get("X-Admin-Token") or "").strip()
+    return bool(want) and bool(got) and hmac.compare_digest(want.encode(), got.encode())
+
+
+@app.route("/api/reports/status")
+def reports_status():
+    out = {"available": REPORTS.available, "delete_enabled": bool(_admin_token()),
+           "timezone": str(getattr(REPORTS_TZ, "key", "UTC")), "max": REPORTS_MAX}
+    if REPORTS.available:
+        out["count"] = REPORTS.count()
+    else:
+        out["message"] = "Report library is unavailable on this server."
+    return jsonify(out)
+
+
+@app.route("/api/reports", methods=["POST"])
+def save_report():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="Send JSON: {report_token, ticker}"), 400
+    if "html" in data:
+        # Reports are only ever saved from the server's own copy (see report_store.PendingCache).
+        return jsonify(error="Reports can't be uploaded — run the report, then save it."), 400
+    if not REPORTS.available:
+        return jsonify(error="Report library is unavailable on this server."), 503
+    token = data.get("report_token")
+    if not isinstance(token, str) or not token:
+        return jsonify(error="report_token is required"), 400
+    pending = PENDING_REPORTS.get(token)
+    if pending is None:
+        return jsonify(error="This report expired — run it again to save it."), 410
+    with pending.lock:                                   # one save per generated report (double-clicks)
+        if pending.saved_id:
+            try:
+                return jsonify({**REPORTS.meta(pending.saved_id), "already_saved": True}), 200
+            except report_store.ReportError:
+                pending.saved_id = None                      # deleted since — allow saving again
+        meta = REPORTS.save(pending.html, pending.rtype, data.get("ticker"), created_at=pending.created_at,
+                            source={**pending.source, "detected_ticker": pending.detected_ticker},
+                            params=pending.params)
+        pending.saved_id = meta["id"]
+    logger.info(f"Saved report {meta['name']} ({meta['size_bytes']:,} bytes)")
+    return jsonify(meta), 201
+
+
+def _int_arg(name, default, lo, hi):
+    try:
+        v = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        raise report_store.ReportError(f"{name} must be a whole number")
+    return max(lo, min(hi, v))
+
+
+@app.route("/api/reports", methods=["GET"])
+def list_reports():
+    if not REPORTS.available:
+        return jsonify(error="Report library is unavailable on this server."), 503
+    rtype = (request.args.get("type") or "").strip().lower() or None
+    if rtype in ("all",):
+        rtype = None
+    rows, total = REPORTS.list(rtype=rtype, ticker=(request.args.get("ticker") or "")[:20] or None,
+                               q=(request.args.get("q") or "")[:100] or None,
+                               limit=_int_arg("limit", 25, 1, 100), offset=_int_arg("offset", 0, 0, 10**6))
+    return jsonify(reports=rows, total=total)
+
+
+@app.route("/api/reports/<rid>", methods=["GET"])
+def get_report(rid):
+    meta, html = REPORTS.get(rid)
+    return jsonify({**meta, "html": html})
+
+
+@app.route("/api/reports/<rid>/download")
+def download_report(rid):
+    meta, html = REPORTS.get(rid)
+    return Response(html.encode("utf-8"), mimetype="text/html; charset=utf-8", headers={
+        "Content-Disposition": f'attachment; filename="{meta["name"]}.html"',
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.route("/api/reports/admin", methods=["POST"])
+def reports_admin_check():
+    if not _admin_token():
+        return jsonify(error="Deleting reports is turned off on this server (REPORTS_ADMIN_TOKEN isn't set)."), 403
+    if not _is_admin():
+        return jsonify(error="Wrong admin token."), 403
+    return jsonify(ok=True)
+
+
+@app.route("/api/reports/<rid>", methods=["DELETE"])
+def delete_report(rid):
+    if not _admin_token():
+        return jsonify(error="Deleting reports is turned off on this server (REPORTS_ADMIN_TOKEN isn't set)."), 403
+    if not _is_admin():
+        return jsonify(error="Wrong admin token."), 403
+    meta = REPORTS.meta(rid)
+    REPORTS.delete(rid)
+    logger.info(f"Deleted report {meta['name']}")
+    return jsonify(ok=True, id=rid, name=meta["name"])
 
 
 # ── Signal monitoring ──────────────────────────────────────────────────────────
