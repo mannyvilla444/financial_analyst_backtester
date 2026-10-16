@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: finbot-web
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    # One worker process on purpose: the signal thread starts once per process,
+    # so 2 workers would poll every ticker twice and log duplicate signals, and
+    # the lock guarding signals.json only works within a single process.
+    # Threads keep the site responsive while a slow backtest is running.
+    startCommand: gunicorn wsgi:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: FLASK_ENV
+        value: production
+      - key: SIGNAL_POLL_INTERVAL_S
+        value: "3600"
+      - key: TELEGRAM_BOT_TOKEN      # set in the Render dashboard (kept out of git)
+        sync: false
+      # ── Saved Reports library ──────────────────────────────────────────────
+      - key: REPORTS_TZ             # the day in a report's name is the run date in this zone
+        value: America/Los_Angeles
+      - key: REPORTS_ADMIN_TOKEN    # set in the dashboard to allow deleting reports; leave unset to disable
+        sync: false
+      # Without a persistent disk the library is WIPED on every deploy/restart.
+      # Persistent disks need a paid instance. To keep saved reports, uncomment
+      # the disk block and REPORTS_DIR below (and optionally move signals.json too):
+      # - key: REPORTS_DIR
+      #   value: /var/data/saved_reports
+      # - key: SIGNALS_FILE
+      #   value: /var/data/signals.json
+    # disk:
+    #   name: finbot-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

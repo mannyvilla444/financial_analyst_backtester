@@ -1,0 +1,10 @@
+flask>=3.0.0
+gunicorn>=21.2.0
+pandas>=1.5.0
+numpy>=1.23.0
+yfinance>=0.2.40
+tradingview-scraper>=0.4.0
+requests>=2.28.0
+python-dotenv>=1.0.0
+tzdata>=2024.1       # time-zone data for report dates (needed on Windows)
+pytest>=7.0          # tests only (python -m pytest tests)

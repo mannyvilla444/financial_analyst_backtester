@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+signals.json
+signals.json.tmp
+.venv/
+telegram_links.json
+telegram_links.json.tmp
+results/
+.pytest_cache/
+saved_reports/
+_to_delete/
